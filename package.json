@@ -1,0 +1,40 @@
+{
+  "name": "dsh-screen-quiz-helper",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "屏幕共享答题助手：screencapture 截图 + Apple Vision OCR + CoreGraphics 点击，自带答案推理与逐题状态校验的答题循环，零第三方依赖（macOS 13+）",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "macos",
+    "vision-ocr",
+    "coregraphics",
+    "quiz-automation"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "bin",
+    "native",
+    "scripts",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "build:native": "bash scripts/build-native.sh",
+    "check": "node --check index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

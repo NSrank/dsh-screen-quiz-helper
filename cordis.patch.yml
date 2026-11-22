@@ -1,0 +1,4 @@
+# Bundle patch for dsh-screen-quiz-helper: inserts the plugin row into the DSH profile.
+- insert:
+    - id: screen-quiz-helper
+      name: 'dsh-screen-quiz-helper'
