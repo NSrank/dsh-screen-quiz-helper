@@ -79,6 +79,8 @@ const quiz = {
   windowId: null,
   windowPid: null,
   clickMode: 'pointer',
+  fuseCount: 0,
+  perQuestionMs: [],
   startedAt: 0,
   finishedAt: 0,
 }
@@ -144,6 +146,13 @@ async function captureWindow(win) {
     windowId: win.windowId,
     window: { x: win.x, y: win.y, width: win.width, height: win.height },
   }
+}
+
+// 重新抓一帧并解析，供「按钮没读到 / 选项没读到 / 翻页不稳」这类瞬时状态自愈使用
+async function reparseOnce(window) {
+  const shot = await captureWindow(window)
+  const ocr = await ocrShot(shot)
+  return { shot, ocr, parsed: parseQuiz(ocr), badges: await readBadges(window, shot) }
 }
 
 async function ocrShot(shot) {
@@ -375,10 +384,11 @@ function parseQuiz(ocr) {
 
   // 页码只在底部找：公式里也有 a/b，全窗抓会抓错
   const bottomY = ocr.windowY + ocr.windowHeight * 0.62
+  const okPair = (m) => m && Number(m[1]) <= Number(m[2]) && Number(m[2]) >= 2 && Number(m[2]) <= 300
   const pageMatch = ocr.lines
-    .filter((l) => l.centerY > bottomY && l.text.trim().length <= 14)
-    .map((l) => l.text.match(/(\d{1,3})\s*\/\s*(\d{1,3})/))
-    .find((m) => m && Number(m[1]) <= Number(m[2]) && Number(m[2]) >= 2 && Number(m[2]) <= 200)
+    .filter((l) => l.centerY > bottomY && l.text.trim().length <= 32)
+    .map((l) => l.text.match(/(\d{1,3})\s*[/|｜]\s*(\d{1,3})/))
+    .find(okPair)
   const page = pageMatch ? { index: Number(pageMatch[1]), total: Number(pageMatch[2]) } : null
 
   const signature = [
@@ -397,12 +407,11 @@ function parseQuiz(ocr) {
   }
 }
 
-// 首选方案：按颜色检测 A/B/C/D 圆形徽标（不依赖 OCR 认出字母），再按顺序赋字母，
-// 用 OCR 正文做文字校验。徽标的几何位置是确定性的，OCR 丢字母也不影响点击落点。
-async function badgeOptions(window, shot, ocr, parsed) {
-  let res
+// 一次截图只跑一次原生徽标检测，结果供 badgeOptions / detectBadgeState / waitStable 复用，
+// 避免同一张截图反复起子进程（每次约 60~120ms，100 题累计能省十几秒）。
+async function readBadges(window, shot) {
   try {
-    res = await runJSON([
+    const res = await runJSON([
       'badges',
       shot.pngPath,
       String(Math.round(window.x)),
@@ -410,13 +419,33 @@ async function badgeOptions(window, shot, ocr, parsed) {
       String(Math.round(window.width)),
       String(Math.round(window.height)),
     ])
+    return res.badges || []
   } catch {
-    return null
+    return []
   }
+}
+
+// 从原始徽标列表里取出「同一列、选项区内」的 y 序列（逻辑坐标），用于判断翻页是否发生、布局是否稳定
+function badgeYsOf(window, raw) {
+  const floorY = window.y + window.height * 0.25
+  const limitY = window.y + window.height - 60
+  let list = (raw || []).filter((b) => b.y > floorY && b.y < limitY && (b.h ?? 0) <= 34)
+  if (list.length < 2) return null
+  const xs = list.map((b) => b.x).sort((a, b) => a - b)
+  const medianX = xs[Math.floor(xs.length / 2)]
+  list = list.filter((b) => Math.abs(b.x - medianX) <= 8).sort((a, b) => a.y - b.y)
+  if (list.length < 3) return null
+  return list.map((b) => Math.round(b.y))
+}
+
+// 首选方案：按颜色检测 A/B/C/D 圆形徽标（不依赖 OCR 认出字母），再按顺序赋字母，
+// 用 OCR 正文做文字校验。徽标的几何位置是确定性的，OCR 丢字母也不影响点击落点。
+async function badgeOptions(window, shot, ocr, parsed, rawBadges) {
+  const raw = rawBadges || (await readBadges(window, shot))
   const btn = parsed.next || parsed.submit
   const limitY = btn ? btn.y - 10 : window.y + window.height - 10
   const floorY = window.y + window.height * 0.25
-  let list = (res.badges || []).filter((b) => b.y > floorY && b.y < limitY && (b.h ?? 0) <= 34)
+  let list = (raw || []).filter((b) => b.y > floorY && b.y < limitY && (b.h ?? 0) <= 34)
   if (list.length < 2) return null
   // 徽标字母在同一列：先把偏离列的（公式笔画、按钮箭头）排掉
   const xs = list.map((b) => b.x).sort((a, b) => a - b)
@@ -607,17 +636,19 @@ async function inferMissingOptions(window, parsed) {
 function buildPrompt(parsed, hasImage, extraText) {
   const lines = [
     hasImage
-      ? '附图就是题目原图（可能有多张：第一张是整屏截图，第二张是放大后的题目+选项区，公式更清晰）。**请直接看图作答**，下面 OCR 文本只作参考，可能严重残缺。'
-      : '下面是一道选择题的屏幕 OCR 文本（当前模型无法读图，只能靠文字判断）。',
-    'OCR 已知缺陷：字母 b 会被读成 6、∞ 读成 0、≠ 读成 +、上标/指数会被整个丢掉（y=x⁴ 只剩 y=x）、',
-    '分数会被拆成多行（1/2 可能只剩 1、2 两行）、ln 会被读成 In、分式分数线会被读成引号或空白。',
-    '请结合数学含义与选项判断。如果图片和文字都无法确定唯一答案，请只输出 UNSURE。',
-    '否则只输出正确选项的字母（A/B/C/D…），不要解释、不要标点。',
+      ? '附图是题目原图的放大裁剪，请直接看图作答；下面 OCR 文本仅作参考。'
+      : '下面是题目的屏幕 OCR 文本（当前模型不能读图）。',
+  ]
+  if (!hasImage) {
+    lines.push('OCR 已知缺陷：b 读成 6、∞ 读成 0、≠ 读成 +、指数丢失（y=x⁴ 只剩 y=x）、分数被拆成多行、ln 读成 In。')
+  }
+  lines.push(
+    '无法确定唯一答案时只输出 UNSURE；否则只输出选项字母（A/B/C/D），不要解释、不要标点。',
     '',
     `题目：${parsed.question || '(题目文字未识别，请根据选项判断)'}`,
     '选项：',
-    ...parsed.options.map((o) => `${o.letter}. ${o.text}`),
-  ]
+    ...parsed.options.map((o) => `${o.letter}. ${o.text || '(仅识别到徽标)'}`),
+  )
   if (extraText) {
     lines.push('', '【题目区高分重识别文本（与上面同源，OCR 结果可能略有差异，请互相参照）】', extraText)
   }
@@ -658,7 +689,7 @@ async function buildQuestionCrop(ctx, parsed) {
   const big = `/tmp/dsh-quiz-qcrop-${stamp}-big.png`
   try {
     await execCmd('/usr/sbin/screencapture', ['-x', `-R${x},${top},${w},${h}`, raw])
-    await execCmd('sips', ['--resampleWidth', String(Math.max(1200, Math.round(w * 2.5))), raw, '--out', big])
+    await execCmd('sips', ['--resampleWidth', String(Math.min(960, Math.max(720, Math.round(w * 2)))), raw, '--out', big])
   } catch {
     return null
   }
@@ -686,7 +717,7 @@ async function buildHighResText(window, parsed) {
   }
 }
 
-async function askModel(ctx, parsed, pngPath, window) {
+async function askModel(ctx, parsed, pngPath, window, timeoutMs = 15000) {
   const llm = ctx.get('llm')
   if (!llm) throw new Error('LLM 服务不可用，无法自动作答')
   const selection = ctx.get('agentDefaultModel')?.currentSelection?.()
@@ -705,12 +736,11 @@ async function askModel(ctx, parsed, pngPath, window) {
 
   const content = [{ type: 'text', text: buildPrompt(parsed, canImage, '') }]
   if (canImage) {
-    const image = await buildImageBlock(ctx, pngPath)
-    const crop = await buildQuestionCrop(ctx, parsed)
-    const images = [image, crop].filter(Boolean)
-    if (images.length) {
+    // 只发「题目区放大裁剪」这一张图：整屏图信息冗余、图片 token 更贵也更慢
+    const crop = (await buildQuestionCrop(ctx, parsed)) || (await buildImageBlock(ctx, pngPath))
+    if (crop) {
       content[0] = { type: 'text', text: buildPrompt(parsed, true, '') }
-      content.push(...images)
+      content.push(crop)
     }
   } else {
     const extra = await buildHighResText(window, parsed)
@@ -721,6 +751,9 @@ async function askModel(ctx, parsed, pngPath, window) {
   const messages = [{ role: 'user', content }]
   let text = ''
   let reasoning = ''
+  // 思考熔断：单题超过 timeoutMs 未返回就直接中止流，避免模型卡在一道题上把整轮拖死
+  const ac = new AbortController()
+  const timer = setTimeout(() => { try { ac.abort() } catch {} }, timeoutMs)
   try {
     const stream = llm.stream({
       provider: selection.provider,
@@ -729,7 +762,8 @@ async function askModel(ctx, parsed, pngPath, window) {
       messages,
       system: '你是答题助手。只输出一个选项字母。',
       temperature: 0,
-      maxTokens: 800,
+      maxTokens: 400,
+      signal: ac.signal,
       purpose: 'screen-quiz',
     })
     for await (const chunk of stream) {
@@ -737,18 +771,42 @@ async function askModel(ctx, parsed, pngPath, window) {
       else if (chunk.type === 'reasoning-delta') reasoning += chunk.text ?? ''
       else if (chunk.type === 'block-end' && chunk.block?.type === 'text' && chunk.block.text?.length > text.length) text = chunk.block.text
     }
+    // 中止后适配器通常只是结束流、不抛异常：这里必须自己判定成熔断
+    if (ac.signal.aborted) {
+      const err = new Error(`思考熔断：超过 ${timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)}s` : `${timeoutMs}ms`} 未返回答案`)
+      err.code = 'QUIZ_TIMEOUT'
+      throw err
+    }
   } catch (e) {
+    if (ac.signal.aborted) {
+      const err = new Error(`思考熔断：超过 ${timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)}s` : `${timeoutMs}ms`} 未返回答案`)
+      err.code = 'QUIZ_TIMEOUT'
+      throw err
+    }
     throw new Error(`模型调用失败: ${e.message}`)
+  } finally {
+    clearTimeout(timer)
+  }
+  if (ac.signal.aborted) {
+    const err = new Error(`思考熔断：超过 ${Math.round(timeoutMs / 1000)}s 未返回答案`)
+    err.code = 'QUIZ_TIMEOUT'
+    throw err
   }
   const answer = text.trim()
   if (/UNSURE|不确定|无法确定/i.test(answer)) {
-    throw new Error(`模型无法确定该题答案（OCR 可能丢掉了指数或符号），已停止（未点击）：${parsed.question.slice(0, 60)}`)
+    const err = new Error(`模型无法确定该题答案：${parsed.question.slice(0, 60)}`)
+    err.code = 'QUIZ_UNSURE'
+    throw err
   }
   if (answer) return answer
   // 推理模型可能把预算都花在思维链上，正文为空：退回从推理文本末尾找答案
   const m = reasoning.match(/(?:^|[^A-Za-z])([A-H])(?![A-Za-z])/g)
   if (m && m.length) return m[m.length - 1].replace(/[^A-H]/g, '')
-  throw new Error(`模型没有返回答案（正文 ${text.length} 字，推理 ${reasoning.length} 字）`)
+  {
+    const err = new Error(`模型没有返回答案（正文 ${text.length} 字，推理 ${reasoning.length} 字）`)
+    err.code = 'QUIZ_NOANSWER'
+    throw err
+  }
 }
 
 function pickOption(options, answer) {
@@ -772,34 +830,6 @@ function inside(option, bounds) {
 
 // ── 答题循环 ─────────────────────────────────────────────────────────────
 
-// 「下一题」点击后等页码真的变化：翻页有动画/网络延迟，立刻复查会把旧题当成没翻过去，
-// 再点一次就会连跳两题（Q4→Q6 就是这样丢的）
-async function waitPageAdvance(window, prevIdx, prevSig, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    await sleep(500)
-    try {
-      const shot = await captureWindow(window)
-      const ocr = await ocrShot(shot)
-      const p = parseQuiz(ocr)
-      const idx = p.page?.index ?? null
-      const moved = (prevIdx != null && idx != null && idx !== prevIdx) || (prevSig && p.signature !== prevSig)
-      if (moved) {
-        quiz.lastQuestion = {
-          question: p.question,
-          options: p.options.map((o) => `${o.letter}. ${o.text}`),
-          next: p.next?.text || null,
-          submit: p.submit?.text || null,
-        }
-        return { idx, parsed: p, shot, ocr }
-      }
-    } catch {
-      // 截图/OCR 偶发失败：继续等
-    }
-  }
-  return null
-}
-
 // ── 每步操作后的状态校验 ────────────────────────────────────────────────
 // 用户要求：每执行一次操作就截图快速判断状态（题号/选项对应/操作是否真的执行）。
 // 关键信号：选项 A/B/C/D 是蓝色圆形徽标，未选中是细圆环（高约 11 逻辑点），
@@ -807,24 +837,12 @@ async function waitPageAdvance(window, prevIdx, prevSig, timeoutMs = 5000) {
 
 // 返回 { hasBadges, selected, badges }：selected 是当前被选中的徽标（实心圆），
 // hasBadges 表示界面上到底有没有可检测的蓝色徽标（无徽标的纯文字界面则跳过校验）。
-async function detectBadgeState(window, shot, parsed) {
-  let res
-  try {
-    res = await runJSON([
-      'badges',
-      shot.pngPath,
-      String(Math.round(window.x)),
-      String(Math.round(window.y)),
-      String(Math.round(window.width)),
-      String(Math.round(window.height)),
-    ])
-  } catch {
-    return { hasBadges: false, selected: null }
-  }
-  const btn = parsed.next || parsed.submit
+async function detectBadgeState(window, shot, parsed, rawBadges, ignoreButtons = false) {
+  const raw = rawBadges || (await readBadges(window, shot))
+  const btn = ignoreButtons ? null : parsed?.next || parsed?.submit
   const limitY = btn ? btn.y - 10 : window.y + window.height - 10
   const floorY = window.y + window.height * 0.25
-  const list = (res.badges || []).filter((b) => b.y > floorY && b.y < limitY && (b.h ?? 0) <= 34)
+  const list = (raw || []).filter((b) => b.y > floorY && b.y < limitY && (b.h ?? 0) <= 34)
   if (list.length < 2) return { hasBadges: false, selected: null }
   const sorted = [...list].sort((a, b) => (b.h ?? 0) - (a.h ?? 0))
   const filled = sorted[0]
@@ -850,64 +868,97 @@ async function detectBadgeState(window, shot, parsed) {
 // 等待选项布局稳定：翻页后选项徽标有一段短暂的位移动画，动画期间徽标 y 坐标会漂移，
 // 直接按当时的坐标点会点错（实测 Q3 动画中 D 被读成 y=598，稳定后是 y=642）。
 // 连续两次徽标检测的 y 集合一致（±3 逻辑点）才算稳定；连续两次读不到徽标说明不是动画，交给下游处理。
-async function waitStable(window, timeoutMs = 3500) {
+async function waitStable(window, timeoutMs = 2000) {
   const deadline = Date.now() + timeoutMs
-  const floorY = window.y + window.height * 0.25
-  const limitY = window.y + window.height - 60
   let prevYs = null
   let nullCount = 0
-  while (Date.now() < deadline) {
-    await sleep(300)
-    let ys = null
+  while (true) {
+    let shot = null
+    let raw = []
     try {
-      const shot = await captureWindow(window)
-      const res = await runJSON([
-        'badges',
-        shot.pngPath,
-        String(Math.round(window.x)),
-        String(Math.round(window.y)),
-        String(Math.round(window.width)),
-        String(Math.round(window.height)),
-      ])
-      let list = (res.badges || []).filter((b) => b.y > floorY && b.y < limitY && (b.h ?? 0) <= 34)
-      if (list.length >= 2) {
-        const xs = list.map((b) => b.x).sort((a, b) => a - b)
-        const medianX = xs[Math.floor(xs.length / 2)]
-        list = list.filter((b) => Math.abs(b.x - medianX) <= 8).sort((a, b) => a.y - b.y)
-        if (list.length >= 3) ys = list.map((b) => Math.round(b.y))
-      }
+      shot = await captureWindow(window)
+      raw = await readBadges(window, shot)
     } catch {
       // 忽略单次截图/检测失败
     }
+    const ys = badgeYsOf(window, raw)
     if (ys && prevYs && ys.length === prevYs.length && ys.every((v, i) => Math.abs(v - prevYs[i]) <= 3)) {
-      return true
+      return { stable: true, shot, badges: raw, ys }
     }
     if (!ys) {
       nullCount++
-      if (nullCount >= 2) return false
+      if (nullCount >= 2) return { stable: false, shot, badges: raw, ys: null }
     }
+    if (Date.now() >= deadline) return { stable: false, shot, badges: raw, ys }
     prevYs = ys
+    await sleep(200)
+  }
+}
+
+// 极轻量的翻页探测：只截图 + 检测徽标位置，不做整窗 OCR，通常 150~450ms 就能判定。
+// 徽标 y 序列相对本题发生变化（长度不同或任一项差 >4）即可认为翻页成功。
+// 两个信号任一成立即认为翻页成功：
+//   ① 本题刚点的选中实心圆消失了（新页面没有选中项）—— 最可靠，连续两题选项布局完全一样时也能判对；
+//   ② 徽标 y 序列变了（题目高度不同）。
+async function waitAdvanceFast(window, prevYs, prevFilledY = null, timeoutMs = 2500) {
+  if (!prevYs && prevFilledY == null) return false
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await sleep(150)
+    try {
+      const shot = await captureWindow(window)
+      const raw = await readBadges(window, shot)
+      if (prevFilledY != null) {
+        const filled = await detectBadgeState(window, shot, null, raw, true)
+        if (!filled.selected) {
+          await sleep(100)
+          return true
+        }
+      }
+      const ys = badgeYsOf(window, raw)
+      if (ys && prevYs && ys.length) {
+        const same = ys.length === prevYs.length && ys.every((v, i) => Math.abs(v - prevYs[i]) <= 4)
+        if (!same) {
+          await sleep(120)
+          return true
+        }
+      }
+    } catch {
+      // 忽略单次失败
+    }
   }
   return false
 }
 
 // 点击选项后校验：被点的那个选项徽标必须真的变高亮（选中）。没生效重试一次，仍不生效就停。
 async function verifySelection(window, choice, parsed) {
-  await sleep(500)
-  let shot = await captureWindow(window)
-  let state = await detectBadgeState(window, shot, parsed)
-  if (!state.hasBadges) {
-    // 可能是点击后页面重绘，给一次机会再读；两次都读不到才认为是无徽标界面
-    await sleep(400)
-    shot = await captureWindow(window)
-    state = await detectBadgeState(window, shot, parsed)
-  }
-  if (!state.hasBadges) {
-    log('选中态校验：此界面无蓝色徽标，跳过校验')
-    return { ok: true, skipped: true }
-  }
   const targetY = choice.clickY ?? choice.centerY
-  if (state.selected && Math.abs(state.selected.y - targetY) <= 16) {
+  // 轮询而非固定等待：界面通常 150~250ms 内就重绘完成，固定 sleep 500 是纯浪费
+  const check = async (ms) => {
+    const deadline = Date.now() + ms
+    let state = { hasBadges: false, selected: null }
+    while (Date.now() < deadline) {
+      await sleep(120)
+      try {
+        const shot = await captureWindow(window)
+        state = await detectBadgeState(window, shot, parsed)
+      } catch {
+        continue
+      }
+      if (state.selected) return state
+    }
+    return state
+  }
+  const hit = (state) => state.selected && Math.abs(state.selected.y - targetY) <= 16
+  let state = await check(900)
+  if (!state.hasBadges) {
+    state = await check(400)
+    if (!state.hasBadges) {
+      log('选中态校验：此界面无蓝色徽标，跳过校验')
+      return { ok: true, skipped: true }
+    }
+  }
+  if (hit(state)) {
     log(`选中态校验通过：${choice.letter} 徽标已高亮 @(${Math.round(state.selected.x)},${Math.round(state.selected.y)})`)
     return { ok: true }
   }
@@ -916,10 +967,8 @@ async function verifySelection(window, choice, parsed) {
   }
   log(`点击 ${choice.letter} 后未检测到选中态，重试一次`)
   await runJSON(['clickpid', String(window.pid), String(Math.round(choice.clickX ?? choice.centerX)), String(Math.round(choice.clickY ?? choice.centerY)), '1', String(window.windowId), quiz.clickMode])
-  await sleep(500)
-  shot = await captureWindow(window)
-  state = await detectBadgeState(window, shot, parsed)
-  if (state.selected && Math.abs(state.selected.y - targetY) <= 16) {
+  state = await check(900)
+  if (hit(state)) {
     log(`选中态校验通过（重试后）：${choice.letter} @(${Math.round(state.selected.x)},${Math.round(state.selected.y)})`)
     return { ok: true }
   }
@@ -950,31 +999,44 @@ async function runQuiz(ctx, options) {
     quiz.windowPid = window.pid
     log(`定位窗口 #${window.windowId} ${window.owner} «${window.title}» @(${Math.round(window.x)},${Math.round(window.y)}) ${Math.round(window.width)}×${Math.round(window.height)}`)
     await run(['activate', String(window.windowId)])
-    await sleep(500)
+    await sleep(300)
 
     quiz.clickMode = options.clickMode || 'pointer'
     let rounds = 0
-    const maxRounds = options.maxQuestions || 60
-    while (!quiz.stop && rounds < maxRounds) {
+    // maxQuestions 只数「真正作答（含熔断跳过）」的题；已经答过的页只翻页不计数。
+    const maxAnswers = options.maxQuestions || 60
+    const hardCap = maxAnswers + 15
+    while (!quiz.stop && quiz.answered.length < maxAnswers && rounds < hardCap) {
       rounds++
-      // 翻页后选项徽标有短暂位移动画，动画期间 y 会漂移导致点错；先等布局稳定再截图
-      await waitStable(window)
-      const shot = await captureWindow(window)
+      // 翻页后选项徽标有短暂位移动画，动画期间 y 会漂移导致点错；先等布局稳定再截图。
+      // waitStable 返回它最后一次稳定截图与徽标检测结果，后面直接复用，省掉一次截图+一次原生检测。
+      const roundStart = Date.now()
+      let stable = await waitStable(window)
+      if (!stable.stable && !stable.ys) {
+        // 版面还没渲染出徽标（切题动画/重绘），再给一轮；拿不到稳定版面才继续
+        await sleep(250)
+        const again = await waitStable(window)
+        if (again.stable || again.ys) stable = again
+      }
+      let shot = stable.shot || (await captureWindow(window))
+      let badgeRaw = stable.badges || (await readBadges(window, shot))
       let ocr = await ocrShot(shot)
       let parsed = parseQuiz(ocr)
 
       if (!parsed.options.length) {
         // 可能正在切题/渲染，给一次机会；两次都读不到选项就判定异常
-        await sleep(700)
-        const shot2 = await captureWindow(window)
-        ocr = await ocrShot(shot2)
+        await sleep(400)
+        shot = await captureWindow(window)
+        badgeRaw = await readBadges(window, shot)
+        ocr = await ocrShot(shot)
         parsed = parseQuiz(ocr)
         if (!parsed.options.length) throw new Error('检测到界面异常，请人工检查（连续两次截图都没有识别到选项）')
       }
+      const roundYs = badgeYsOf(window, badgeRaw)
 
       {
         // 选项区定位优先级：徽标颜色检测（确定性）> 高分辨率局部裁剪聚类 > 整窗 OCR
-        const byBadge = await badgeOptions(window, shot, ocr, parsed)
+        const byBadge = await badgeOptions(window, shot, ocr, parsed, badgeRaw)
         if (byBadge) {
           parsed = { ...parsed, options: byBadge }
           log(`选项定位（徽标检测）：${byBadge.length} 个（${byBadge.map((o) => o.letter).join('')}）`)
@@ -998,11 +1060,11 @@ async function runQuiz(ctx, options) {
       // ── 三重防重复 ─────────────────────────────────────────────
       // ① 视觉校验：这一题已经有一个选中项（实心徽标），说明之前已答过、翻页没成功
       //    （或退回旧题）。不要重复作答，直接重试点「下一题」。
-      const preState = await detectBadgeState(window, shot, parsed)
+      const preState = await detectBadgeState(window, shot, parsed, badgeRaw)
       log(`第 ${pageIdx ?? '?'} 题（已答页：${[...quiz.answeredPages].join(',') || '无'}；选中项：${preState.selected ? Math.round(preState.selected.y) : '无'}）`)
       if (preState.selected) {
-        const advanced = await waitPageAdvance(window, pageIdx, parsed.signature, 1200)
-        if (advanced) continue
+        // 截图是本轮 waitStable 刚拍的，版面已经是当前状态，不需要再干等一轮探测：
+        // 直接点「下一题」，点完再用 waitAdvanceFast 确认（每省一次探测约省 1.5s）。
         const key = pageIdx != null ? `p${pageIdx}` : parsed.signature
         const retries = (quiz.pageRetries.get(key) || 0) + 1
         quiz.pageRetries.set(key, retries)
@@ -1010,7 +1072,7 @@ async function runQuiz(ctx, options) {
         log(`该题已有选中项（不重复作答），重试点击「下一题」(${retries}/2)`)
         if (parsed.next) {
           await clickNext(window, parsed)
-          await waitPageAdvance(window, pageIdx, parsed.signature, options.advanceTimeout ?? 5000)
+          await waitAdvanceFast(window, roundYs, preState.selected.y, options.advanceTimeout ?? 2000)
           continue
         }
         finish('该题已作答（已有选中项），请人工提交')
@@ -1025,7 +1087,7 @@ async function runQuiz(ctx, options) {
         log(`第 ${pageIdx} 题记录为已答，但界面无选中项，按未作答处理`)
       }
       if (pageIdx != null && quiz.answeredPages.has(pageIdx)) {
-        const advanced = await waitPageAdvance(window, pageIdx, parsed.signature, 2500)
+        const advanced = await waitAdvanceFast(window, roundYs, null, 2500)
         if (advanced) continue
         const key = `p${pageIdx}`
         const retries = (quiz.pageRetries.get(key) || 0) + 1
@@ -1034,7 +1096,7 @@ async function runQuiz(ctx, options) {
         log(`仍在第 ${pageIdx} 题，重试点击「下一题」(${retries}/2)`)
         if (parsed.next) {
           await clickNext(window, parsed)
-          await sleep(options.stepDelay ?? 900)
+          await sleep(options.stepDelay ?? 300)
           continue
         }
       }
@@ -1047,11 +1109,56 @@ async function runQuiz(ctx, options) {
       // 最后一题（只剩「提交」）也要作答，只是不点提交
       // 「下一题」和「提交」都没读到时不能当成末题（曾把 OCR 抖动误判成最后一题而提前收工）
       if (!parsed.next && !parsed.submit) {
-        throw new Error('既没有识别到「下一题」也没有识别到「提交」，界面可能异常，已停止（未点击）')
+        // 翻页动画/重绘期间底部按钮行可能整行读不到：重抓两次再判，不能一次没读到就报错
+        let healed = false
+        for (let i = 0; i < 2 && !healed; i++) {
+          await sleep(250)
+          try {
+            const re = await reparseOnce(window)
+            if (re.parsed.next || re.parsed.submit) {
+              shot = re.shot
+              ocr = re.ocr
+              badgeRaw = re.badges
+              parsed = re.parsed
+              healed = true
+              log(`底部按钮首帧未识别，重抓 ${i + 1} 次后恢复`)
+            }
+          } catch {
+            // 重抓失败继续
+          }
+        }
+        if (!healed) throw new Error('既没有识别到「下一题」也没有识别到「提交」，界面可能异常，已停止（未点击）')
       }
       const lastQuestion = !parsed.next && !!parsed.submit
 
-      const answer = await askModel(ctx, parsed, shot.pngPath, window)
+      const qTimeout = options.questionTimeoutMs ?? 15000
+      let answer
+      try {
+        answer = await askModel(ctx, parsed, shot.pngPath, window, qTimeout)
+      } catch (e) {
+        if (e.code === 'QUIZ_TIMEOUT' || e.code === 'QUIZ_UNSURE' || e.code === 'QUIZ_NOANSWER' || e.code === 'QUIZ_NOMAP') {
+          // 思考熔断：模型卡住或明确说无法确定 —— 不在这道题上耗时间，记一笔直接跳过
+          const why = e.code === 'QUIZ_TIMEOUT'
+            ? `超过 ${qTimeout >= 1000 ? `${Math.round(qTimeout / 1000)}s` : `${qTimeout}ms`} 未作答`
+            : e.code === 'QUIZ_NOANSWER'
+              ? '模型未返回答案（可用输出被思维链占满）'
+              : e.code === 'QUIZ_NOMAP'
+                ? '答案字母与识别到的选项对不上（选项定位不完整）'
+                : '模型无法确定答案'
+          log(`思考熔断（${why}），跳过第 ${pageIdx ?? '?'} 题`)
+          quiz.answered.push({ question: parsed.question.slice(0, 80), answer: `(熔断跳过：${why})` })
+          quiz.fuseCount = (quiz.fuseCount || 0) + 1
+          if (pageIdx != null) quiz.answeredPages.add(pageIdx)
+          if (lastQuestion) {
+            finish('最后一题熔断跳过，请人工处理并提交')
+            return
+          }
+          await clickNext(window, parsed)
+          await waitAdvanceFast(window, roundYs, null, options.advanceTimeout ?? 2000)
+          continue
+        }
+        throw e
+      }
       let choice = pickOption(parsed.options, answer)
       if (!choice) {
         const band = await bandOptions(window, parsed, ocr.lines)
@@ -1092,7 +1199,11 @@ async function runQuiz(ctx, options) {
         const ocr2 = await ocrShot(shot2)
         const parsed2 = parseQuiz(ocr2)
         const choice2 = pickOption(parsed2.options, answer)
-        if (!choice2) throw new Error(`答案「${answer}」无法与识别到的选项文字匹配，已停止（未点击）。选项：${parsed.options.map((o) => o.letter).join('/')}`)
+        if (!choice2) {
+          const err = new Error(`答案「${answer}」无法与识别到的选项文字匹配（选项：${parsed.options.map((o) => o.letter).join('/')}）`)
+          err.code = 'QUIZ_NOMAP'
+          throw err
+        }
         parsed = parsed2
         choice = choice2
       }
@@ -1108,6 +1219,8 @@ async function runQuiz(ctx, options) {
       // 点击后立即截图校验：被点的选项徽标是否真的变高亮（选中）
       await verifySelection(window, choice, parsed)
       quiz.answered.push({ question: parsed.question.slice(0, 80), answer: `${choice.letter}. ${choice.text}` })
+      quiz.perQuestionMs.push(Date.now() - roundStart)
+      if (quiz.perQuestionMs.length > 200) quiz.perQuestionMs.splice(0, quiz.perQuestionMs.length - 200)
       if (pageIdx != null) quiz.answeredPages.add(pageIdx)
       if (lastQuestion) {
         finish(parsed.submit ? '最后一题已作答（按钮为「提交」），请人工提交' : '最后一题已作答（未找到「提交」按钮），请人工检查并提交')
@@ -1116,15 +1229,17 @@ async function runQuiz(ctx, options) {
       if (quiz.stop) break
       await runJSON(['clickpid', String(window.pid), String(parsed.next.centerX), String(parsed.next.centerY), '1', String(window.windowId), quiz.clickMode])
       log(`已答第 ${quiz.answered.length} 题，点击「下一题」`)
-      if (pageIdx != null) {
-        const advanced = await waitPageAdvance(window, pageIdx, parsed.signature, options.advanceTimeout ?? 5000)
-        if (!advanced) log(`点击「下一题」后页码未变化（仍为 ${pageIdx}），下一轮会重试`)
+      if (roundYs) {
+        const advanced = await waitAdvanceFast(window, roundYs, choice.clickY ?? choice.centerY, options.advanceTimeout ?? 2500)
+        if (!advanced) log(`点击「下一题」后界面未变化（仍为第 ${pageIdx ?? '?'} 题），下一轮会重试`)
       } else {
-        await sleep(options.stepDelay ?? 900)
+        // 无蓝色徽标界面（例如网页测试页）没有廉价信号，只能短等，后面靠 waitStable 兜住动画
+        await sleep(options.stepDelay ?? 300)
       }
     }
     if (quiz.stop) finish('已停止答题')
-    else if (rounds >= maxRounds) finish(`达到最大题数 ${maxRounds}，已停止`)
+    else if (quiz.answered.length >= maxAnswers) finish(`达到最大题数 ${maxAnswers}（实际作答 ${quiz.answered.length} 题），已停止`)
+    else finish(`连续 ${rounds} 轮没有作答成功（可能一直在翻已答页），已停止`)
   } catch (e) {
     quiz.error = e.message
     quiz.phase = 'error'
@@ -1340,6 +1455,7 @@ export function apply(ctx) {
         keyword: { type: 'string', description: '窗口标题关键词，默认「屏幕共享」' },
         maxQuestions: { type: 'integer', description: '最多自动作答几题，默认 60' },
         clickMode: { type: 'string', description: '点击方式：pointer=真实光标点击后立刻还原位置（默认，兼容性最好）；pid=只注入到目标进程不碰光标；auto=自动判断', default: 'pointer' },
+        questionTimeoutMs: { type: 'integer', description: '思考熔断阈值（毫秒）：单题模型超过该时间未给出答案就跳过该题进入下一题，默认 15000' },
       },
       presentCall: present('开始答题'),
       async execute(args) {
@@ -1373,7 +1489,7 @@ export function apply(ctx) {
         quiz.last = null
         quiz.startedAt = Date.now()
         log(`启动，关键词「${args.keyword || '屏幕共享'}」`)
-        runQuiz(ctx, { keyword: args.keyword, maxQuestions: args.maxQuestions, clickMode: args.clickMode })
+        runQuiz(ctx, { keyword: args.keyword, maxQuestions: args.maxQuestions, clickMode: args.clickMode, questionTimeoutMs: args.questionTimeoutMs })
         await sleep(1200)
         return { started: true, message: '答题循环已启动', status: statusSnapshot() }
       },
@@ -1413,6 +1529,10 @@ export function apply(ctx) {
       windowId: quiz.windowId,
       answeredCount: quiz.answered.length,
       answered: quiz.answered.slice(-20),
+      fuseCount: quiz.fuseCount || 0,
+      avgMsPerQuestion: quiz.perQuestionMs.length
+        ? Math.round(quiz.perQuestionMs.reduce((a, b) => a + b, 0) / quiz.perQuestionMs.length)
+        : null,
       lastQuestion: quiz.last,
       error: quiz.error,
       log: quiz.log.slice(-20),
